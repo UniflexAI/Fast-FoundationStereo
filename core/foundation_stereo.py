@@ -12,9 +12,10 @@ from core.submodule import (
     BasicConv, Conv3dNormActReduced, ResnetBasicBlock3D, BasicConv_IN, Conv2x,
     FeatureAtt, CostVolumeDisparityAttention, SpatialAttentionExtractor,
     ChannelAttentionEnhancement, disparity_regression, context_upsample,
-    build_gwc_volume_optimized_pytorch1, build_gwc_volume_triton,
+    build_gwc_volume_optimized_pytorch1, build_gwc_volume_optimized_pytorch1,
     build_concat_volume_optimized_pytorch1, build_concat_volume_optimized_pytorch,
 )
+from core.gwc_custom_op import build_gwc_volume_custom
 from core.utils.utils import InputPadder
 import Utils as U
 import time
@@ -128,6 +129,9 @@ class hourglass(nn.Module):
         else:
           conv = self.post8_to_4(x, conv)
 
+        # Ensure 5D so ONNX If branches match: [1,48,120,216] -> [1,1,48,120,216]
+        if conv.dim() == 4:
+          conv = conv.unsqueeze(1)
         return conv
 
 
@@ -203,7 +207,7 @@ class FastFoundationStereo(nn.Module):
       if optimize_build_volume=='pytorch1':
         gwc_volume = build_gwc_volume_optimized_pytorch1(features_left[0], features_right[0], self.args.max_disp//4, self.cv_group, normalize=self.args.normalize)
       elif optimize_build_volume=='triton':
-        gwc_volume = build_gwc_volume_triton(features_left[0], features_right[0], self.args.max_disp//4, self.cv_group, normalize=self.args.normalize)
+        gwc_volume = build_gwc_volume_optimized_pytorch1(features_left[0], features_right[0], self.args.max_disp//4, self.cv_group, normalize=self.args.normalize)
       else:
         raise RuntimeError(f"Invalid optimize_build_volume: {optimize_build_volume}")
 
@@ -340,10 +344,10 @@ class TrtPostRunner(nn.Module):
     comb_volume = self.corr_feature_att(comb_volume, features_left_04)
     comb_volume = self.cost_agg(comb_volume, features_left)
 
-    # Init disp from geometry encoding volume
-    logits = self.classifier(comb_volume).squeeze(1)
+    # Init disp from geometry encoding volume (keep 5D until disparity_regression for ONNX If shape match)
+    logits = self.classifier(comb_volume)  # (B, 1, D, H, W)
     prob = F.softmax(logits, dim=1)
-    init_disp = disparity_regression(prob, self.args.max_disp//4)
+    init_disp = disparity_regression(prob.squeeze(1), self.args.max_disp//4)
 
     cnet_list = self.cnet(features_left[0], features_left[1], features_left[2])
     cnet_list = list(cnet_list)
@@ -358,18 +362,39 @@ class TrtPostRunner(nn.Module):
     disp = init_disp.to(self.dtype)
 
     # GRUs iterations to update disparity (1/4 resolution)
+    # Always produce disp_up so ONNX Loop/If branches have matching shapes ([1,1,H,W])
+    disp_up = None
     for itr in range(self.args.valid_iters):
       disp = disp.detach()
       geo_feat = geo_fn(disp, coords, dx=self.dx, low_memory=True)
       net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat.to(self.dtype), disp, att)
 
       disp = disp + delta_disp.to(self.dtype)
-      if itr < self.args.valid_iters-1:
-        continue
-
       disp_up = self.upsample_disp(disp.to(self.dtype), mask_feat_4.to(self.dtype), stem_2x.to(self.dtype))
 
     return disp_up
+
+
+class TrtFullRunner(nn.Module):
+  """Full model: feature -> build_gwc_volume (custom op) -> post. Exports as single ONNX with BuildGwcVolume node."""
+  def __init__(self, model):
+    super().__init__()
+    self.feature_runner = TrtFeatureRunner(model)
+    self.post_runner = TrtPostRunner(model)
+    self.max_disp = model.args.max_disp
+    self.cv_group = model.cv_group
+
+  def forward(self, left, right):
+    feat = self.feature_runner(left, right)
+    features_left_04, features_left_08, features_left_16, features_left_32, features_right_04, stem_2x = feat
+    gwc_volume = build_gwc_volume_custom(
+        features_left_04, features_right_04,
+        self.max_disp // 4, self.cv_group, normalize=True,
+    )
+    return self.post_runner(
+        features_left_04, features_left_08, features_left_16, features_left_32,
+        features_right_04, stem_2x, gwc_volume,
+    )
 
 
 class TrtRunner(nn.Module):
@@ -432,7 +457,7 @@ class TrtRunner(nn.Module):
   def forward(self, image1, image2):
     import tensorrt as trt
     feat_out = self.run_trt(self.feature_engine, self.feature_context, {'left': image1, 'right': image2})
-    gwc_volume = build_gwc_volume_triton(feat_out['features_left_04'].half(), feat_out['features_right_04'].half(), self.args.max_disp//4, self.cv_group)
+    gwc_volume = build_gwc_volume_optimized_pytorch1(feat_out['features_left_04'].half(), feat_out['features_right_04'].half(), self.args.max_disp//4, self.cv_group)
     post_inputs = feat_out
     post_inputs['gwc_volume'] = gwc_volume
     in_names = self.get_io_tensor_names(self.post_engine, trt.TensorIOMode.INPUT)

@@ -56,7 +56,7 @@ if __name__=="__main__":
     for i in range(args.total):
       torch.cuda.synchronize()
       t0 = time.perf_counter()
-      disp = model.forward(img0, img1, iters=args.valid_iters, test_mode=True, optimize_build_volume='triton')
+      disp = model.forward(img0, img1, iters=args.valid_iters, test_mode=True, optimize_build_volume='pytorch1')
       torch.cuda.synchronize()
       elapsed = time.perf_counter() - t0
       times.append(elapsed)

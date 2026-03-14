@@ -1,25 +1,17 @@
-import warnings, argparse, logging, os, sys,zipfile
+import warnings, argparse, logging, os, sys
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 os.environ['TORCHDYNAMO_DISABLE'] = '1'
 code_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(f'{code_dir}/../')
-import omegaconf, yaml, torch,pdb
+import yaml
+import torch
 from omegaconf import OmegaConf
-from core.foundation_stereo import FastFoundationStereo, TrtFeatureRunner, TrtPostRunner, build_gwc_volume_triton
+from core.foundation_stereo import TrtFeatureRunner, TrtPostRunner, TrtFullRunner
+from core.gwc_custom_op import register_gwc_onnx_symbolic
 import Utils as U
 
-
-class FoundationStereoOnnx(FastFoundationStereo):
-    def __init__(self, args):
-        super().__init__(args)
-
-    @torch.no_grad()
-    def forward(self, left, right):
-        """ Removes extra outputs and hyper-parameters """
-        with torch.amp.autocast('cuda', enabled=True, dtype=U.AMP_DTYPE):
-            disp = FastFoundationStereo.forward(self, left, right, iters=self.args.valid_iters, test_mode=True, optimize_build_volume=False)
-        return disp
-
+# BuildGwcVolume is a custom op for TensorRT; ONNX checker does not know it
+import torch.onnx.errors as onnx_errors
 
 
 if __name__ == '__main__':
@@ -37,8 +29,9 @@ if __name__ == '__main__':
     parser.add_argument('--n_gru_layers', type=int, default=1, help="number of hidden GRU levels")
     parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
     parser.add_argument('--low_memory', type=int, default=1, help='reduce memory usage')
+    parser.add_argument('--split', action='store_true', help='also export feature_runner and post_runner separately (for two-engine TRT)')
     args = parser.parse_args()
-    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+    os.makedirs(args.save_path.rstrip('/'), exist_ok=True)
 
     torch.autograd.set_grad_enabled(False)
 
@@ -47,38 +40,60 @@ if __name__ == '__main__':
     model.args.valid_iters = args.valid_iters
     model.cuda().eval()
 
-    feature_runner = TrtFeatureRunner(model)
-    post_runner = TrtPostRunner(model)
-
-    feature_runner.cuda().eval()
-    post_runner.cuda().eval()
     assert args.height % 32 == 0 and args.width % 32 == 0, "height and width must be divisible by 32"
-    left_img = torch.randn(1, 3, args.height, args.width).cuda().float()*255
-    right_img = torch.randn(1, 3, args.height, args.width).cuda().float()*255
+    left_img = torch.randn(1, 3, args.height, args.width).cuda().float() * 255
+    right_img = torch.randn(1, 3, args.height, args.width).cuda().float() * 255
 
-    torch.onnx.export(
-        feature_runner,
-        (left_img, right_img),
-        args.save_path+'/feature_runner.onnx',
-        opset_version=17,
-        input_names = ['left', 'right'],
-        output_names = ['features_left_04', 'features_left_08', 'features_left_16', 'features_left_32', 'features_right_04', 'stem_2x'],
-        do_constant_folding=True
-    )
+    # Single ONNX with BuildGwcVolume custom op (for single TRT engine)
+    full_runner = TrtFullRunner(model)
+    full_runner.cuda().eval()
+    register_gwc_onnx_symbolic()
+    try:
+        torch.onnx.export(
+            full_runner,
+            (left_img, right_img),
+            args.save_path + '/foundation_stereo.onnx',
+            opset_version=17,
+            input_names=['left', 'right'],
+            output_names=['disp'],
+            do_constant_folding=True,
+        )
+    except onnx_errors.CheckerError as e:
+        if "BuildGwcVolume" in str(e):
+            # ONNX checker does not know our custom TRT plugin op; file is already written
+            pass
+        else:
+            raise
+    print(f"Saved foundation_stereo.onnx (single ONNX with BuildGwcVolume) to {args.save_path}")
 
-    features_left_04, features_left_08, features_left_16, features_left_32, features_right_04, stem_2x = feature_runner(left_img, right_img)
-    gwc_volume = build_gwc_volume_triton(features_left_04.half(), features_right_04.half(), args.max_disp//4, model.cv_group)
-    disp = post_runner(features_left_04.float(), features_left_08.float(), features_left_16.float(), features_left_32.float(), features_right_04.float(), stem_2x.float(), gwc_volume.float())
-
-    torch.onnx.export(
-        post_runner,
-        (features_left_04, features_left_08, features_left_16, features_left_32, features_right_04, stem_2x, gwc_volume),
-        args.save_path+'/post_runner.onnx',
-        opset_version=17,
-        input_names = ['features_left_04', 'features_left_08', 'features_left_16', 'features_left_32', 'features_right_04', 'stem_2x', 'gwc_volume'],
-        output_names = ['disp'],
-        do_constant_folding=True
-    )
+    if args.split:
+        # Also export feature_runner and post_runner for two-engine TRT
+        from core.foundation_stereo import build_gwc_volume_optimized_pytorch1
+        feature_runner = TrtFeatureRunner(model)
+        post_runner = TrtPostRunner(model)
+        feature_runner.cuda().eval()
+        post_runner.cuda().eval()
+        torch.onnx.export(
+            feature_runner,
+            (left_img, right_img),
+            args.save_path + '/feature_runner.onnx',
+            opset_version=17,
+            input_names=['left', 'right'],
+            output_names=['features_left_04', 'features_left_08', 'features_left_16', 'features_left_32', 'features_right_04', 'stem_2x'],
+            do_constant_folding=True,
+        )
+        features_left_04, features_left_08, features_left_16, features_left_32, features_right_04, stem_2x = feature_runner(left_img, right_img)
+        gwc_volume = build_gwc_volume_optimized_pytorch1(features_left_04.half(), features_right_04.half(), args.max_disp//4, model.cv_group)
+        torch.onnx.export(
+            post_runner,
+            (features_left_04, features_left_08, features_left_16, features_left_32, features_right_04, stem_2x, gwc_volume),
+            args.save_path + '/post_runner.onnx',
+            opset_version=17,
+            input_names=['features_left_04', 'features_left_08', 'features_left_16', 'features_left_32', 'features_right_04', 'stem_2x', 'gwc_volume'],
+            output_names=['disp'],
+            do_constant_folding=True,
+        )
+        print(f"Saved feature_runner.onnx, post_runner.onnx to {args.save_path}")
 
     with open(f'{args.save_path}/onnx.yaml', 'w') as f:
-      yaml.safe_dump(OmegaConf.to_container(model.args), f)
+        yaml.safe_dump(OmegaConf.to_container(model.args), f)
