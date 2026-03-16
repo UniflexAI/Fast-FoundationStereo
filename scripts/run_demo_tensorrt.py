@@ -9,7 +9,7 @@ from Utils import (
     set_logging_format, set_seed, vis_disparity,
     depth2xyzmap, toOpen3dCloud, o3d,
 )
-from core.foundation_stereo import TrtRunner
+from core.foundation_stereo import SingleTrtRunner, TrtRunner
 import cv2
 
 
@@ -27,6 +27,7 @@ if __name__=="__main__":
   parser.add_argument('--denoise_radius', type=float, default=0.03, help='radius to use for outlier removal')
   parser.add_argument('--get_pc', type=int, default=1, help='save point cloud output')
   parser.add_argument('--zfar', type=float, default=100, help="max depth to include in point cloud")
+  parser.add_argument('--engine_path', type=str, default=None, help='Path to a single TensorRT engine. If omitted, auto-detect from onnx_dir.')
   args = parser.parse_args()
 
   set_logging_format()
@@ -42,7 +43,27 @@ if __name__=="__main__":
       cfg[k] = args.__dict__[k]
   args = OmegaConf.create(cfg)
   logging.info(f"args:\n{args}")
-  model = TrtRunner(args, args.onnx_dir+'/feature_runner.engine', args.onnx_dir+'/post_runner.engine')
+  engine_path = args.engine_path
+  if engine_path is None:
+    single_engine = os.path.join(args.onnx_dir, 'foundation_stereo.engine')
+    feature_engine = os.path.join(args.onnx_dir, 'feature_runner.engine')
+    post_engine = os.path.join(args.onnx_dir, 'post_runner.engine')
+    if os.path.exists(single_engine):
+      engine_path = single_engine
+    elif os.path.exists(feature_engine) and os.path.exists(post_engine):
+      engine_path = None
+    else:
+      raise FileNotFoundError(
+        f"Could not find TensorRT engine(s) in {args.onnx_dir}. "
+        "Expected either foundation_stereo.engine or feature_runner.engine + post_runner.engine."
+      )
+
+  if engine_path is not None:
+    logging.info(f"Using single TensorRT engine: {engine_path}")
+    model = SingleTrtRunner(args, engine_path)
+  else:
+    logging.info("Using split TensorRT engines: feature_runner.engine + post_runner.engine")
+    model = TrtRunner(args, feature_engine, post_engine)
 
   img0 = imageio.imread(args.left_file)
   img1 = imageio.imread(args.right_file)

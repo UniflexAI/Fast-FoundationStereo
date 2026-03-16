@@ -118,6 +118,16 @@ python scripts/make_onnx.py --model_dir weights/23-36-37/model_best_bp2_serializ
 
 Refer to `scripts/make_onnx.py` for a comprehensive list of available flags.  Since some intermediate operation is not supported by TRT conversion. We split around it into 2 onnx files.
 
+Experimental single-file export is also available:
+```
+python scripts/make_onnx.py --model_dir weights/23-36-37/model_best_bp2_serialize.pth --save_path output/ --height 448 --width 640 --valid_iters 8 --max_disp 192 --single_onnx
+```
+This path replaces the Triton GWC volume builder with the pure PyTorch implementation during export so the whole model can be serialized into `output/foundation_stereo.onnx`. It is intended for ONNX export experiments; TensorRT compatibility still needs to be validated on the resulting graph.
+You can build a single TensorRT engine from it as below:
+```
+trtexec --onnx=output/foundation_stereo.onnx --saveEngine=output/foundation_stereo.engine --fp16 --useCudaGraph
+```
+
 Then convert from ONNX to TRT as below.
 ```
 trtexec --onnx=output/feature_runner.onnx --saveEngine=output/feature_runner.engine --fp16  --useCudaGraph
@@ -139,6 +149,7 @@ To use TRT for inference:
 ```
 python scripts/run_demo_tensorrt.py --onnx_dir output/ --left_file assets/left.png --right_file assets/right.png --intrinsic_file assets/K.txt --out_dir output/ --remove_invisible 0 --denoise_cloud 1  --get_pc 1 --zfar 100
 ```
+If `output/` contains `foundation_stereo.engine`, the demo will use the single-engine path automatically. You can also pass `--engine_path output/foundation_stereo.engine` explicitly.
 
 # Internet-Scale Pseudo-Labeling
 Real-world data offers greater diversity and realism than synthetic data. However, obtaining real stereo images with ground-truth metric depth annotation is notoriously difficult. To address this challenge, we propose an automatic data curation pipeline to generate pseudo-labels on internet-scale stereo images from [Stereo4D](https://stereo4d.github.io/) dataset. **Top:** Pseudo-labeling pipeline on in-the-wild internet stereo data. **Bottom:** Visualization of our generated pseudo-labels.
