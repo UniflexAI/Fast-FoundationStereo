@@ -432,7 +432,7 @@ class TrtRunner(nn.Module):
   def forward(self, image1, image2):
     import tensorrt as trt
     feat_out = self.run_trt(self.feature_engine, self.feature_context, {'left': image1, 'right': image2})
-    gwc_volume = build_gwc_volume_triton(feat_out['features_left_04'].half(), feat_out['features_right_04'].half(), self.args.max_disp//4, self.cv_group)
+    gwc_volume = build_gwc_volume_triton(feat_out['features_left_04'].half(), feat_out['features_right_04'].half(), self.args.max_disp//4, self.cv_group, normalize=self.args.normalize)
     post_inputs = feat_out
     post_inputs['gwc_volume'] = gwc_volume
     in_names = self.get_io_tensor_names(self.post_engine, trt.TensorIOMode.INPUT)
