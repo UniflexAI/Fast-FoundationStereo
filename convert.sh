@@ -9,7 +9,7 @@ python scripts/run_demo.py \
    --scale 1 \
    --get_pc 0 \
    --valid_iters 4 \
-   --max_disp 48 \
+   --max_disp 64 \
    --zfar 100
 
 # 480x848 input, padded to 480x864 (nearest multiple of 32)
@@ -20,7 +20,7 @@ python scripts/make_onnx.py \
   --height 480 \
   --width 864 \
   --valid_iters 4 \
-  --max_disp 48
+  --max_disp 64
 
 #trtexec --onnx=output/480x864/feature_runner.onnx --saveEngine=output/480x864/feature_runner.engine  --useCudaGraph
 #trtexec --onnx=output/480x864/post_runner.onnx --saveEngine=output/480x864/post_runner.engine   --useCudaGraph
@@ -43,7 +43,7 @@ python scripts/make_onnx.py \
   --height 480 \
   --width 864 \
   --valid_iters 4 \
-  --max_disp 192 \
+  --max_disp 64 \
   --single
 
 export PATH=/usr/local/cuda-12.8/bin:$PATH
