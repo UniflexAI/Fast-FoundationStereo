@@ -76,11 +76,25 @@ int32_t GwcVolumePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInpu
 bool GwcVolumePlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    if (inOut[pos].desc.format != TensorFormat::kLINEAR)
+    if (inOut[pos].desc.format != TensorFormat::kLINEAR) {
         return false;
-    if (pos < 2)
-        return inOut[pos].desc.type == DataType::kFLOAT || inOut[pos].desc.type == DataType::kHALF;
-    return inOut[pos].desc.type == DataType::kHALF;
+    }
+
+    // Inputs: ref, tgt. Require same type for both inputs because enqueue()
+    // dispatches one kernel path based on input 0 type and interprets both
+    // input pointers with that type.
+    if (pos == 0) {
+        return inOut[0].desc.type == DataType::kFLOAT || inOut[0].desc.type == DataType::kHALF;
+    }
+    if (pos == 1) {
+        return inOut[1].desc.type == inOut[0].desc.type;
+    }
+
+    // Output is always fp16 cost volume.
+    if (pos == 2) {
+        return inOut[2].desc.type == DataType::kHALF;
+    }
+    return false;
 }
 
 int32_t GwcVolumePlugin::configurePlugin(
@@ -95,13 +109,20 @@ int32_t GwcVolumePlugin::configurePlugin(
 int32_t GwcVolumePlugin::onShapeChange(
     PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    (void)out;
-    (void)nbOutputs;
+    (void)nbInputs;
     B_ = in[0].dims.d[0];
     C_ = in[0].dims.d[1];
     H_ = in[0].dims.d[2];
     W_ = in[0].dims.d[3];
     useFp16Input_ = (in[0].type == DataType::kHALF);
+
+    // IMPORTANT: derive (G, D) from the output tensor shape to avoid
+    // relying on plugin field parsing (which can differ across TRT/ONNX parser versions).
+    // Output is (B, G, D, H, W).
+    if (nbOutputs >= 1 && out != nullptr && out[0].dims.nbDims == 5) {
+        num_groups_ = out[0].dims.d[1];
+        maxdisp_ = out[0].dims.d[2];
+    }
     return 0;
 }
 
@@ -134,11 +155,29 @@ PluginFieldCollection const* GwcVolumePlugin::getFieldsToSerialize() noexcept
 int32_t GwcVolumePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
-    (void)outputDesc;
     (void)workspace;
     DataType type = inputDesc[0].type;
+    if (inputDesc[1].type != type) {
+        return 1;
+    }
+
+    int B = B_, C = C_, H = H_, W = W_, D = maxdisp_, G = num_groups_;
+    if (inputDesc[0].dims.nbDims == 4) {
+        B = inputDesc[0].dims.d[0];
+        C = inputDesc[0].dims.d[1];
+        H = inputDesc[0].dims.d[2];
+        W = inputDesc[0].dims.d[3];
+    }
+    if (outputDesc[0].dims.nbDims == 5) {
+        G = outputDesc[0].dims.d[1];
+        D = outputDesc[0].dims.d[2];
+    }
+    if (B <= 0 || C <= 0 || H <= 0 || W <= 0 || D <= 0 || G <= 0 || (C % G) != 0) {
+        return 1;
+    }
+
     launchBuildGwc(type, inputs[0], inputs[1], outputs[0],
-        B_, C_, H_, W_, maxdisp_, num_groups_, stream);
+        B, C, H, W, D, G, stream);
     return 0;
 }
 
@@ -166,9 +205,11 @@ IPluginV3* GwcVolumePluginCreator::createPlugin(char const* name, PluginFieldCol
     int32_t maxdisp = 48;
     int32_t num_groups = 8;
     for (int32_t i = 0; i < fc->nbFields; ++i) {
-        if (strcmp(fc->fields[i].name, "maxdisp") == 0)
+        // Depending on parser/version, fields may arrive either as "maxdisp"
+        // or as the ONNX attribute-style "maxdisp_i". Accept both.
+        if (strcmp(fc->fields[i].name, "maxdisp") == 0 || strcmp(fc->fields[i].name, "maxdisp_i") == 0)
             maxdisp = *static_cast<int32_t const*>(fc->fields[i].data);
-        else if (strcmp(fc->fields[i].name, "num_groups") == 0)
+        else if (strcmp(fc->fields[i].name, "num_groups") == 0 || strcmp(fc->fields[i].name, "num_groups_i") == 0)
             num_groups = *static_cast<int32_t const*>(fc->fields[i].data);
     }
     return new GwcVolumePlugin(maxdisp, num_groups);
