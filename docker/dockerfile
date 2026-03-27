@@ -31,7 +31,8 @@ RUN conda init bash &&\
 COPY requirements.txt /tmp/requirements.txt
 RUN conda activate my &&\
     uv pip install -r /tmp/requirements.txt &&\
-    uv pip install onnxruntime-gpu onnx pycuda cuda-python tensorrt-cu12 tensorrt-lean-cu12 tensorrt-dispatch-cu12 nvidia-modelopt[torch] &&\
+    uv pip install onnxruntime-gpu onnx onnxscript pycuda cuda-python tensorrt-cu12 tensorrt-lean-cu12 tensorrt-dispatch-cu12 nvidia-modelopt[torch] &&\
+    uv pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128 &&\
     conda install -y -c anaconda h5py &&\
     conda install -y -c conda-forge libstdcxx-ng
 
