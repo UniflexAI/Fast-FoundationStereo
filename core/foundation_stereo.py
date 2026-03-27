@@ -443,3 +443,56 @@ class TrtRunner(nn.Module):
     out = self.run_trt(self.post_engine, self.post_context, post_inputs)
     disp = out['disp']
     return disp
+class SingleTrtRunner(nn.Module):
+  def __init__(self, args, engine_path):
+    super().__init__()
+    import tensorrt as trt
+    self.args = args
+    self.trt_logger = trt.Logger(trt.Logger.WARNING)
+    with open(engine_path, 'rb') as file:
+      engine_data = file.read()
+    self.engine = trt.Runtime(self.trt_logger).deserialize_cuda_engine(engine_data)
+    self.context = self.engine.create_execution_context()
+
+  def trt_dtype_to_torch(self, dt):
+    import tensorrt as trt
+    if dt==trt.DataType.FLOAT: return torch.float32
+    if dt==trt.DataType.HALF: return torch.float16
+    if dt==trt.DataType.BF16: return torch.bfloat16
+    if dt==trt.DataType.INT32: return torch.int32
+    if dt==trt.DataType.INT8: return torch.int8
+    if dt==trt.DataType.BOOL: return torch.bool
+    raise RuntimeError(f"Unsupported TRT dtype: {dt}")
+
+  def get_io_tensor_names(self, engine, mode):
+    names = []
+    n = engine.num_io_tensors
+    for i in range(n):
+      name = engine.get_tensor_name(i)
+      if engine.get_tensor_mode(name)==mode:
+        names.append(name)
+    return names
+
+  def run_trt(self, engine, context, inputs_by_name:dict):
+    import tensorrt as trt
+    for name, tensor in list(inputs_by_name.items()):
+      expected_dtype = self.trt_dtype_to_torch(engine.get_tensor_dtype(name))
+      if tensor.dtype != expected_dtype: inputs_by_name[name] = tensor.to(expected_dtype)
+      if not inputs_by_name[name].is_contiguous(): inputs_by_name[name] = inputs_by_name[name].contiguous()
+      context.set_input_shape(name, tuple(inputs_by_name[name].shape))
+    outputs = {}
+    out_names = [n for n in self.get_io_tensor_names(engine, trt.TensorIOMode.OUTPUT)]
+    for name in out_names:
+      shp = tuple(context.get_tensor_shape(name))
+      dtype = self.trt_dtype_to_torch(engine.get_tensor_dtype(name))
+      outputs[name] = torch.empty(shp, device='cuda', dtype=dtype)
+    for name, tensor in inputs_by_name.items(): context.set_tensor_address(name, int(tensor.data_ptr()))
+    for name, tensor in outputs.items(): context.set_tensor_address(name, int(tensor.data_ptr()))
+    stream = torch.cuda.current_stream().cuda_stream
+    ok = context.execute_async_v3(stream)
+    assert ok
+    return outputs
+
+  def forward(self, image1, image2):
+    out = self.run_trt(self.engine, self.context, {'left': image1, 'right': image2})
+    return out['disp']
