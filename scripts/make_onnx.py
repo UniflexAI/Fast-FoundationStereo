@@ -4,6 +4,7 @@ os.environ['TORCHDYNAMO_DISABLE'] = '1'
 code_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(f'{code_dir}/../')
 import omegaconf, yaml, torch,pdb
+import torch.nn as nn
 from omegaconf import OmegaConf
 from core.foundation_stereo import FastFoundationStereo, TrtFeatureRunner, TrtPostRunner, build_gwc_volume_triton
 import Utils as U
@@ -56,7 +57,7 @@ if __name__ == '__main__':
     parser.add_argument('--single_onnx', action='store_true', help='Export the full model to a single ONNX file using the pure PyTorch volume builder')
     parser.add_argument('--single_onnx_name', type=str, default='foundation_stereo.onnx', help='Filename for the single-model ONNX export')
     args = parser.parse_args()
-    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+    os.makedirs(args.save_path, exist_ok=True)
 
     torch.autograd.set_grad_enabled(False)
 
@@ -72,10 +73,11 @@ if __name__ == '__main__':
             (torch.randn(1, 3, args.height, args.width).cuda().float()*255,
              torch.randn(1, 3, args.height, args.width).cuda().float()*255),
             os.path.join(args.save_path, args.single_onnx_name),
-            opset_version=17,
+            opset_version=18,
             input_names=['left', 'right'],
             output_names=['disp'],
-            do_constant_folding=True
+            do_constant_folding=True,
+            external_data=False
         )
         with open(f'{args.save_path}/onnx.yaml', 'w') as f:
             yaml.safe_dump(OmegaConf.to_container(model.args), f)
@@ -93,7 +95,7 @@ if __name__ == '__main__':
             feature_runner,
             (left_img, right_img),
             args.save_path+'/feature_runner.onnx',
-            opset_version=17,
+            opset_version=18,
             input_names = ['left', 'right'],
             output_names = ['features_left_04', 'features_left_08', 'features_left_16', 'features_left_32', 'features_right_04', 'stem_2x'],
             do_constant_folding=True
@@ -107,7 +109,7 @@ if __name__ == '__main__':
             post_runner,
             (features_left_04, features_left_08, features_left_16, features_left_32, features_right_04, stem_2x, gwc_volume),
             args.save_path+'/post_runner.onnx',
-            opset_version=17,
+            opset_version=18,
             input_names = ['features_left_04', 'features_left_08', 'features_left_16', 'features_left_32', 'features_right_04', 'stem_2x', 'gwc_volume'],
             output_names = ['disp'],
             do_constant_folding=True
